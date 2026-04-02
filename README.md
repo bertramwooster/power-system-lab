@@ -144,7 +144,7 @@ The web-based interactive lab manual includes:
 - **Code tabs** — copy Python or MATLAB code directly from the browser
 - **Theory sections** — key equations and procedural steps for each experiment
 
-Access it at: 🔗 *[Published artifact URL]*  
+Access it at this repo's webpage 
 No installation, no login, no account needed — just a web browser.
 
 ---
