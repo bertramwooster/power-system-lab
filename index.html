@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Power System Simulation Lab — PCC-EE804L</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.min.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 0; background: #0f172a; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useMemo } = React;
+const {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  ReferenceLine, Cell
+} = Recharts;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAUSS-SEIDEL POWER FLOW SOLVER (per-unit)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildYbus(buses, lines) {
+  const n = buses.length;
+  const Y = Array.from({ length: n }, () => Array.from({ length: n }, () => ({ re: 0, im: 0 })));
+  for (const line of lines) {
+    const i = line.from, j = line.to;
+    if (i >= n || j >= n || i === j) continue;
+    const zmag2 = line.r * line.r + line.x * line.x;
+    if (zmag2 < 1e-12) continue;
+    const g = line.r / zmag2, b = -line.x / zmag2;
+    Y[i][j].re -= g; Y[i][j].im -= b;
+    Y[j][i].re -= g; Y[j][i].im -= b;
+    Y[i][i].re += g; Y[i][i].im += b + (line.b_half || 0);
+    Y[j][j].re += g; Y[j][j].im += b + (line.b_half || 0);
+  }
+  for (let i = 0; i < n; i++) {
+    if (buses[i].g_shunt || buses[i].b_shunt) {
+      Y[i][i].re += (buses[i].g_shunt || 0);
+      Y[i][i].im += (buses[i].b_shunt || 0);
+    }
+  }
+  return Y;
+}
+
+function solvePowerFlow(buses, lines, maxIter = 300, tol = 1e-6) {
+  const n = buses.length;
+  if (n === 0) return { buses: [], lines: [], converged: false, iterations: 0 };
+  const Y = buildYbus(buses, lines);
+  let V = buses.map(b => {
+    const mag = (b.type === "PV" || b.type === "Slack") ? b.v_set : 1.0;
+    return { re: mag, im: 0 };
+  });
+  const cmul = (a, b) => ({ re: a.re*b.re - a.im*b.im, im: a.re*b.im + a.im*b.re });
+  const conj = (a) => ({ re: a.re, im: -a.im });
+  const cmag = (a) => Math.sqrt(a.re*a.re + a.im*a.im);
+  const cang = (a) => Math.atan2(a.im, a.re) * 180 / Math.PI;
+  const cdiv = (a, b) => { const d = b.re*b.re + b.im*b.im; return d < 1e-20 ? {re:0,im:0} : { re: (a.re*b.re + a.im*b.im)/d, im: (a.im*b.re - a.re*b.im)/d }; };
+
+  let converged = false, iterations = 0;
+  for (let iter = 0; iter < maxIter; iter++) {
+    for (let i = 0; i < n; i++) {
+      if (buses[i].type === "Slack") continue;
+      const p_net = (buses[i].p_gen || 0) - (buses[i].p_load || 0);
+      let q_net = (buses[i].q_gen || 0) - (buses[i].q_load || 0);
+      if (buses[i].type === "PV") {
+        let Qi = 0;
+        for (let j = 0; j < n; j++) {
+          const YV = cmul({ re: Y[i][j].re, im: Y[i][j].im }, V[j]);
+          Qi += V[i].re * YV.im - V[i].im * YV.re;
+        }
+        q_net = Qi;
+      }
+      let sum = { re: 0, im: 0 };
+      for (let j = 0; j < n; j++) {
+        if (j === i) continue;
+        const yv = cmul({ re: Y[i][j].re, im: Y[i][j].im }, V[j]);
+        sum.re += yv.re; sum.im += yv.im;
+      }
+      const sv = cdiv({ re: p_net, im: -q_net }, conj(V[i]));
+      const Vnew = cdiv({ re: sv.re - sum.re, im: sv.im - sum.im }, { re: Y[i][i].re, im: Y[i][i].im });
+      if (buses[i].type === "PV") {
+        const mag = cmag(Vnew);
+        if (mag > 1e-10) { const s = buses[i].v_set / mag; V[i] = { re: Vnew.re*s, im: Vnew.im*s }; }
+      } else { V[i] = Vnew; }
+    }
+    iterations = iter + 1;
+    let maxMismatch = 0;
+    for (let i = 0; i < n; i++) {
+      if (buses[i].type === "Slack") continue;
+      let Si = { re: 0, im: 0 };
+      for (let j = 0; j < n; j++) {
+        const YV = cmul({ re: Y[i][j].re, im: Y[i][j].im }, V[j]);
+        const s = cmul(V[i], conj(YV));
+        Si.re += s.re; Si.im += s.im;
+      }
+      const p_net = (buses[i].p_gen || 0) - (buses[i].p_load || 0);
+      const q_net = (buses[i].q_gen || 0) - (buses[i].q_load || 0);
+      maxMismatch = Math.max(maxMismatch, Math.abs(Si.re - p_net));
+      if (buses[i].type === "PQ") maxMismatch = Math.max(maxMismatch, Math.abs(Si.im - q_net));
+    }
+    if (maxMismatch < tol) { converged = true; break; }
+  }
+  const busResults = buses.map((b, i) => {
+    let Pi = 0, Qi = 0;
+    for (let j = 0; j < n; j++) {
+      const YV = cmul({ re: Y[i][j].re, im: Y[i][j].im }, V[j]);
+      const S = cmul(V[i], conj(YV));
+      Pi += S.re; Qi += S.im;
+    }
+    return { name: b.name, type: b.type, vm: cmag(V[i]), va: cang(V[i]), p_inj: Pi, q_inj: Qi };
+  });
+  const lineResults = lines.map(l => {
+    const i = l.from, j = l.to, zmag2 = l.r*l.r + l.x*l.x;
+    if (zmag2 < 1e-12 || i >= n || j >= n) return { name: `${i+1}→${j+1}`, p_from:0, q_from:0, p_to:0, q_to:0, p_loss:0, q_loss:0 };
+    const yser = { re: l.r/zmag2, im: -l.x/zmag2 };
+    const I_ij = cmul({ re: V[i].re-V[j].re, im: V[i].im-V[j].im }, yser);
+    const I_ji = cmul({ re: V[j].re-V[i].re, im: V[j].im-V[i].im }, yser);
+    const S_ij = cmul(V[i], conj(I_ij)), S_ji = cmul(V[j], conj(I_ji));
+    return { name: `${buses[i]?.name}→${buses[j]?.name}`, p_from: S_ij.re, q_from: S_ij.im, p_to: S_ji.re, q_to: S_ji.im, p_loss: S_ij.re+S_ji.re, q_loss: S_ij.im+S_ji.im };
+  });
+  return { buses: busResults, lines: lineResults, converged, iterations, Y };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEFAULT 4-BUS SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+const DEFAULT_BUSES = [
+  { name: "Bus 1", type: "Slack", v_set: 1.04, p_gen: 0, q_gen: 0, p_load: 0, q_load: 0, g_shunt: 0, b_shunt: 0 },
+  { name: "Bus 2", type: "PV", v_set: 1.025, p_gen: 0.5, q_gen: 0, p_load: 0, q_load: 0, g_shunt: 0, b_shunt: 0 },
+  { name: "Bus 3", type: "PQ", v_set: 1.0, p_gen: 0, q_gen: 0, p_load: 0.8, q_load: 0.3, g_shunt: 0, b_shunt: 0 },
+  { name: "Bus 4", type: "PQ", v_set: 1.0, p_gen: 0, q_gen: 0, p_load: 0.4, q_load: 0.05, g_shunt: 0, b_shunt: 0.05 },
+];
+const DEFAULT_LINES = [
+  { from: 0, to: 1, r: 0.01, x: 0.05, b_half: 0.02 },
+  { from: 0, to: 2, r: 0.02, x: 0.08, b_half: 0.03 },
+  { from: 1, to: 2, r: 0.01, x: 0.04, b_half: 0.015 },
+  { from: 1, to: 3, r: 0.015, x: 0.06, b_half: 0.02 },
+  { from: 2, to: 3, r: 0.01, x: 0.03, b_half: 0.01 },
+];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COLORS AND HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+const C = {
+  bg: "#0f172a", card: "#1e293b", border: "#334155", borderLight: "#475569",
+  text: "#cbd5e1", textDim: "#64748b", textBright: "#f8fafc", textMuted: "#94a3b8",
+  blue: "#3b82f6", green: "#22c55e", red: "#ef4444", yellow: "#eab308",
+  purple: "#a78bfa", orange: "#f97316", cyan: "#22d3ee",
+};
+const vColor = (v) => v >= 0.95 && v <= 1.05 ? C.green : v >= 0.90 && v <= 1.10 ? C.yellow : C.red;
+const typeColor = (t) => t === "Slack" ? C.blue : t === "PV" ? C.purple : C.orange;
+
+function NumberInput({ label, value, onChange, step = 0.01, min, max, unit, width = "w-16" }) {
+  return (
+    <div className="flex items-center gap-1">
+      {label && <span className="text-xs" style={{ color: C.textDim }}>{label}</span>}
+      <input type="number" value={value} step={step} min={min} max={max}
+        onChange={e => onChange(+e.target.value)}
+        className={`${width} px-1 py-0.5 rounded text-xs font-mono text-right`}
+        style={{ background: C.bg, color: C.textBright, border: `1px solid ${C.border}` }} />
+      {unit && <span className="text-xs" style={{ color: C.textDim }}>{unit}</span>}
+    </div>
+  );
+}
+
+function SelectInput({ value, onChange, options, labels }) {
+  return (
+    <select value={value} onChange={e => onChange(e.target.value)}
+      className="px-1 py-0.5 rounded text-xs font-mono"
+      style={{ background: C.bg, color: C.textBright, border: `1px solid ${C.border}` }}>
+      {options.map((o, i) => <option key={o} value={o}>{labels ? labels[i] : o}</option>)}
+    </select>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ONE-LINE DIAGRAM (SVG)
+// ═══════════════════════════════════════════════════════════════════════════
+function OneLine({ buses, lines, results }) {
+  if (!results?.buses?.length) return null;
+  const n = results.buses.length;
+  const cx = 300, cy = 175, R = n <= 4 ? 120 : 140;
+  const pos = results.buses.map((_, i) => {
+    const angle = -Math.PI/2 + (2*Math.PI*i)/n;
+    return { x: cx + R*Math.cos(angle), y: cy + R*Math.sin(angle) };
+  });
+  return (
+    <svg viewBox="0 0 600 350" className="w-full max-w-2xl mx-auto" style={{ fontFamily: "monospace" }}>
+      <defs>
+        <pattern id="g" width="20" height="20" patternUnits="userSpaceOnUse">
+          <path d="M 20 0 L 0 0 0 20" fill="none" stroke={C.border} strokeWidth="0.3"/>
+        </pattern>
+      </defs>
+      <rect width="600" height="350" fill={C.bg} rx="8"/>
+      <rect width="600" height="350" fill="url(#g)" rx="8"/>
+      {lines.map((l, idx) => {
+        if (l.from >= n || l.to >= n) return null;
+        const a = pos[l.from], b = pos[l.to], lr = results.lines[idx];
+        const mx = (a.x+b.x)/2, my = (a.y+b.y)/2;
+        return (<g key={idx}>
+          <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={C.borderLight} strokeWidth="1.5" strokeDasharray="5,3"/>
+          <rect x={mx-30} y={my-7} width="60" height="14" rx="3" fill={C.card} stroke={C.border} strokeWidth="0.5"/>
+          <text x={mx} y={my+3.5} textAnchor="middle" fontSize="7.5" fill={C.textMuted}>{lr ? Math.abs(lr.p_from).toFixed(3) : "—"} p.u.</text>
+        </g>);
+      })}
+      {results.buses.map((b, i) => {
+        const p = pos[i];
+        return (<g key={i}>
+          <circle cx={p.x} cy={p.y} r="26" fill={C.card} stroke={vColor(b.vm)} strokeWidth="2.5"/>
+          <text x={p.x} y={p.y-9} textAnchor="middle" fontSize="8.5" fontWeight="bold" fill={C.textBright}>{b.name}</text>
+          <text x={p.x} y={p.y+2} textAnchor="middle" fontSize="7.5" fill={vColor(b.vm)}>|V|={b.vm.toFixed(4)}</text>
+          <text x={p.x} y={p.y+12} textAnchor="middle" fontSize="6.5" fill={C.textDim}>δ={b.va.toFixed(2)}°</text>
+          <rect x={p.x-12} y={p.y-24} width="24" height="10" rx="3" fill={typeColor(b.type)} opacity="0.2"/>
+          <text x={p.x} y={p.y-17} textAnchor="middle" fontSize="6.5" fontWeight="bold" fill={typeColor(b.type)}>{b.type}</text>
+        </g>);
+      })}
+      <text x="12" y="338" fontSize="7.5" fill={C.textDim}>
+        {results.converged ? `✓ Converged in ${results.iterations} iter (Gauss-Seidel)` : "✗ Did not converge"} · All values in p.u.
+      </text>
+      <text x="588" y="338" textAnchor="end" fontSize="7.5" fill={C.textDim}>
+        ΣP_loss = {results.lines.reduce((s,l)=>s+l.p_loss,0).toFixed(5)} p.u.
+      </text>
+    </svg>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTERACTIVE POWER FLOW
+// ═══════════════════════════════════════════════════════════════════════════
+function InteractivePF() {
+  const [mode, setMode] = useState("curated");
+  const [buses, setBuses] = useState(JSON.parse(JSON.stringify(DEFAULT_BUSES)));
+  const [lines, setLines] = useState(JSON.parse(JSON.stringify(DEFAULT_LINES)));
+  const [sBase, setSBase] = useState(100);
+  const [vBase, setVBase] = useState(110);
+  const [showYbus, setShowYbus] = useState(false);
+
+  const updateBus = (i, field, val) => {
+    const b = JSON.parse(JSON.stringify(buses));
+    b[i][field] = val;
+    if (field === "type" && val === "Slack") b.forEach((bus, j) => { if (j !== i && bus.type === "Slack") b[j].type = "PQ"; });
+    setBuses(b);
+  };
+  const updateLine = (i, field, val) => {
+    const l = JSON.parse(JSON.stringify(lines)); l[i][field] = val; setLines(l);
+  };
+  const addBus = () => setBuses([...buses, { name: `Bus ${buses.length+1}`, type: "PQ", v_set: 1.0, p_gen: 0, q_gen: 0, p_load: 0.2, q_load: 0.1, g_shunt: 0, b_shunt: 0 }]);
+  const removeBus = (i) => {
+    if (buses.length <= 2) return;
+    const nb = buses.filter((_,j) => j !== i);
+    const nl = lines.filter(l => l.from !== i && l.to !== i).map(l => ({ ...l, from: l.from > i ? l.from-1 : l.from, to: l.to > i ? l.to-1 : l.to }));
+    if (!nb.some(b => b.type === "Slack")) nb[0].type = "Slack";
+    setBuses(nb); setLines(nl);
+  };
+  const addLine = () => {
+    if (buses.length < 2) return;
+    const ex = new Set(lines.map(l => `${Math.min(l.from,l.to)}-${Math.max(l.from,l.to)}`));
+    for (let i = 0; i < buses.length; i++) for (let j = i+1; j < buses.length; j++)
+      if (!ex.has(`${i}-${j}`)) { setLines([...lines, { from: i, to: j, r: 0.01, x: 0.05, b_half: 0.02 }]); return; }
+  };
+  const removeLine = (i) => setLines(lines.filter((_,j) => j !== i));
+  const resetDefault = () => { setBuses(JSON.parse(JSON.stringify(DEFAULT_BUSES))); setLines(JSON.parse(JSON.stringify(DEFAULT_LINES))); };
+
+  const results = useMemo(() => solvePowerFlow(buses, lines), [buses, lines]);
+
+  const exportPython = () => {
+    let c = `import pandapower as pp\n\nnet = pp.create_empty_network(sn_mva=${sBase}, f_hz=50.0)\n\n`;
+    buses.forEach((b, i) => { c += `b${i} = pp.create_bus(net, vn_kv=${vBase}, name="${b.name}")\n`; });
+    c += `\n`;
+    buses.forEach((b, i) => {
+      if (b.type === "Slack") c += `pp.create_ext_grid(net, bus=b${i}, vm_pu=${b.v_set})\n`;
+      else if (b.type === "PV") c += `pp.create_gen(net, bus=b${i}, p_mw=${(b.p_gen*sBase).toFixed(1)}, vm_pu=${b.v_set})\n`;
+      if (b.p_load > 0 || b.q_load > 0) c += `pp.create_load(net, bus=b${i}, p_mw=${(b.p_load*sBase).toFixed(1)}, q_mvar=${(b.q_load*sBase).toFixed(1)})\n`;
+      if (b.b_shunt) c += `pp.create_shunt(net, bus=b${i}, q_mvar=${(-b.b_shunt*sBase).toFixed(1)})\n`;
+    });
+    c += `\nZ_base = ${vBase}**2 / ${sBase}\n`;
+    lines.forEach(l => {
+      c += `pp.create_line_from_parameters(net, b${l.from}, b${l.to}, length_km=1, r_ohm_per_km=${(l.r*vBase**2/sBase).toFixed(4)}, x_ohm_per_km=${(l.x*vBase**2/sBase).toFixed(4)}, c_nf_per_km=${(l.b_half/(2*Math.PI*50)*1e9*sBase/vBase**2).toFixed(2)}, max_i_ka=1.0)\n`;
+    });
+    c += `\npp.runpp(net, algorithm='nr')\nprint(net.res_bus[['vm_pu','va_degree','p_mw','q_mvar']])\nprint(net.res_line[['loading_percent','pl_mw','ql_mvar']])\n`;
+    navigator.clipboard.writeText(c);
+    alert("pandapower code copied to clipboard!");
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2 p-2.5 rounded-lg" style={{ background: C.card, border: `1px solid ${C.border}` }}>
+        <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${C.border}` }}>
+          {["curated","builder"].map(m => (
+            <button key={m} onClick={() => { setMode(m); if (m==="curated") resetDefault(); }}
+              className="px-3 py-1 text-xs font-medium" style={{ background: mode===m ? C.blue : "transparent", color: mode===m ? "#fff" : C.textMuted }}>
+              {m==="curated" ? "4-Bus Default" : "N-Bus Builder"}
+            </button>
+          ))}
+        </div>
+        <NumberInput label="S_base" value={sBase} onChange={setSBase} step={10} min={1} unit="MVA" />
+        <NumberInput label="V_base" value={vBase} onChange={setVBase} step={1} min={1} unit="kV" />
+        {mode==="builder" && <>
+          <button onClick={addBus} className="px-2 py-1 rounded text-xs" style={{ background: C.border, color: C.textBright }}>+ Bus</button>
+          <button onClick={addLine} className="px-2 py-1 rounded text-xs" style={{ background: C.border, color: C.textBright }}>+ Line</button>
+        </>}
+        <div className="ml-auto flex gap-2">
+          <button onClick={() => setShowYbus(!showYbus)} className="px-2 py-1 rounded text-xs" style={{ background: showYbus ? C.blue+"33" : C.border, color: showYbus ? C.cyan : C.textMuted }}>Y-bus</button>
+          <button onClick={exportPython} className="px-2 py-1 rounded text-xs" style={{ background: "#065f46", color: "#6ee7b7" }}>Export Python</button>
+        </div>
+      </div>
+
+      {/* Bus editor */}
+      <div className="rounded-lg overflow-hidden" style={{ border: `1px solid ${C.border}` }}>
+        <div className="px-3 py-1.5 text-xs font-bold tracking-wider" style={{ background: C.card, color: C.textMuted }}>BUSES (all values in p.u. on {sBase} MVA, {vBase} kV base)</div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs" style={{ background: C.bg }}>
+            <thead><tr style={{ borderBottom: `1px solid ${C.border}` }}>
+              {["Name","Type","|V| set","P_gen","Q_gen","P_load","Q_load","B_sh",mode==="builder"?"":""].filter(Boolean).map((h,i)=>
+                <th key={i} className="px-2 py-1 text-left font-medium" style={{ color: C.textDim }}>{h}</th>)}
+            </tr></thead>
+            <tbody>{buses.map((b, i) => (
+              <tr key={i} style={{ borderBottom: `1px solid ${C.border}15` }}>
+                <td className="px-2 py-0.5"><input value={b.name} onChange={e => updateBus(i,"name",e.target.value)} className="w-14 px-1 text-xs font-mono" style={{ background:"transparent", color: C.textBright, border:"none" }}/></td>
+                <td className="px-2 py-0.5"><SelectInput value={b.type} onChange={v => updateBus(i,"type",v)} options={["Slack","PV","PQ"]} /></td>
+                <td className="px-2"><NumberInput value={b.v_set} onChange={v=>updateBus(i,"v_set",v)} step={0.005}/></td>
+                <td className="px-2"><NumberInput value={b.p_gen} onChange={v=>updateBus(i,"p_gen",v)}/></td>
+                <td className="px-2"><NumberInput value={b.q_gen} onChange={v=>updateBus(i,"q_gen",v)}/></td>
+                <td className="px-2"><NumberInput value={b.p_load} onChange={v=>updateBus(i,"p_load",v)}/></td>
+                <td className="px-2"><NumberInput value={b.q_load} onChange={v=>updateBus(i,"q_load",v)}/></td>
+                <td className="px-2"><NumberInput value={b.b_shunt} onChange={v=>updateBus(i,"b_shunt",v)}/></td>
+                {mode==="builder" && <td className="px-1"><button onClick={()=>removeBus(i)} style={{color:C.red}} className="text-xs">✕</button></td>}
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Line editor */}
+      <div className="rounded-lg overflow-hidden" style={{ border: `1px solid ${C.border}` }}>
+        <div className="px-3 py-1.5 text-xs font-bold tracking-wider" style={{ background: C.card, color: C.textMuted }}>LINES (impedance in p.u.)</div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs" style={{ background: C.bg }}>
+            <thead><tr style={{ borderBottom: `1px solid ${C.border}` }}>
+              {["From","To","R","X","B/2",mode==="builder"?"":""].filter(Boolean).map((h,i)=>
+                <th key={i} className="px-2 py-1 text-left font-medium" style={{ color: C.textDim }}>{h}</th>)}
+            </tr></thead>
+            <tbody>{lines.map((l, i) => (
+              <tr key={i} style={{ borderBottom: `1px solid ${C.border}15` }}>
+                <td className="px-2 py-0.5">{mode==="builder" ? <SelectInput value={l.from} onChange={v=>updateLine(i,"from",+v)} options={buses.map((_,j)=>j)} labels={buses.map(b=>b.name)}/> : <span className="font-mono" style={{color:C.textBright}}>{buses[l.from]?.name}</span>}</td>
+                <td className="px-2 py-0.5">{mode==="builder" ? <SelectInput value={l.to} onChange={v=>updateLine(i,"to",+v)} options={buses.map((_,j)=>j)} labels={buses.map(b=>b.name)}/> : <span className="font-mono" style={{color:C.textBright}}>{buses[l.to]?.name}</span>}</td>
+                <td className="px-2"><NumberInput value={l.r} onChange={v=>updateLine(i,"r",v)} step={0.001}/></td>
+                <td className="px-2"><NumberInput value={l.x} onChange={v=>updateLine(i,"x",v)} step={0.001}/></td>
+                <td className="px-2"><NumberInput value={l.b_half} onChange={v=>updateLine(i,"b_half",v)} step={0.001}/></td>
+                {mode==="builder" && <td className="px-1"><button onClick={()=>removeLine(i)} style={{color:C.red}} className="text-xs">✕</button></td>}
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <OneLine buses={buses} lines={lines} results={results}/>
+
+      {/* Y-bus display */}
+      {showYbus && results.Y && (
+        <div className="p-3 rounded-lg overflow-x-auto" style={{ background: C.card, border: `1px solid ${C.border}` }}>
+          <div className="text-xs font-bold mb-2" style={{ color: C.textMuted }}>Y-BUS MATRIX (complex admittance, p.u.)</div>
+          <table className="text-xs font-mono"><tbody>
+            <tr><td></td>{buses.map((b,j) => <td key={j} className="px-2 py-0.5 text-center" style={{color:C.textDim}}>{b.name}</td>)}</tr>
+            {results.Y.map((row, i) => (
+              <tr key={i}>
+                <td className="px-2 py-0.5" style={{color:C.textDim}}>{buses[i].name}</td>
+                {row.map((y, j) => (
+                  <td key={j} className="px-2 py-0.5 text-right" style={{color: i===j ? C.cyan : C.text, fontSize: 10}}>
+                    {y.re.toFixed(3)}{y.im >= 0 ? "+" : ""}{y.im.toFixed(3)}j
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody></table>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <div className="p-3 rounded-lg" style={{ background: C.card, border: `1px solid ${C.border}` }}>
+          <div className="text-xs font-bold mb-2" style={{ color: C.textMuted }}>VOLTAGE PROFILE</div>
+          <ResponsiveContainer width="100%" height={170}>
+            <BarChart data={results.buses} margin={{ top: 15, right: 5, left: -20, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={C.border}/>
+              <XAxis dataKey="name" tick={{ fill: C.textDim, fontSize: 9 }}/>
+              <YAxis domain={[0.9, 1.1]} tick={{ fill: C.textDim, fontSize: 9 }}/>
+              <ReferenceLine y={1.05} stroke={C.borderLight} strokeDasharray="4 4"/>
+              <ReferenceLine y={0.95} stroke={C.borderLight} strokeDasharray="4 4"/>
+              <Tooltip contentStyle={{ background: C.card, border: `1px solid ${C.border}`, color: C.text, fontSize: 11 }} formatter={v=>`${v.toFixed(4)} p.u.`}/>
+              <Bar dataKey="vm" radius={[4,4,0,0]}>{results.buses.map((b,i) => <Cell key={i} fill={vColor(b.vm)}/>)}</Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="p-3 rounded-lg" style={{ background: C.card, border: `1px solid ${C.border}` }}>
+          <div className="text-xs font-bold mb-2" style={{ color: C.textMuted }}>BUS RESULTS (p.u.)</div>
+          <table className="w-full text-xs font-mono"><thead>
+            <tr>{["Bus","Type","|V|","δ°","P_inj","Q_inj"].map(h=><th key={h} className="text-right px-1 py-0.5" style={{color:C.textDim}}>{h}</th>)}</tr>
+          </thead><tbody>{results.buses.map((b,i)=>(
+            <tr key={i} style={{ borderTop: `1px solid ${C.border}22` }}>
+              <td className="px-1 text-left" style={{color:C.textBright}}>{b.name}</td>
+              <td className="px-1 text-right" style={{color:typeColor(b.type)}}>{b.type}</td>
+              <td className="px-1 text-right" style={{color:vColor(b.vm)}}>{b.vm.toFixed(4)}</td>
+              <td className="px-1 text-right" style={{color:C.text}}>{b.va.toFixed(2)}</td>
+              <td className="px-1 text-right" style={{color:C.text}}>{b.p_inj.toFixed(4)}</td>
+              <td className="px-1 text-right" style={{color:C.text}}>{b.q_inj.toFixed(4)}</td>
+            </tr>
+          ))}</tbody></table>
+          <div className="mt-2 pt-1 text-xs" style={{ color: C.textDim, borderTop: `1px solid ${C.border}33` }}>
+            Total: P_loss={results.lines.reduce((s,l)=>s+l.p_loss,0).toFixed(5)}, Q_loss={results.lines.reduce((s,l)=>s+l.q_loss,0).toFixed(5)} p.u.
+          </div>
+        </div>
+      </div>
+
+      {/* Line results */}
+      <div className="p-3 rounded-lg" style={{ background: C.card, border: `1px solid ${C.border}` }}>
+        <div className="text-xs font-bold mb-2" style={{ color: C.textMuted }}>LINE FLOWS (p.u.)</div>
+        <table className="w-full text-xs font-mono"><thead>
+          <tr>{["Line","P_from","Q_from","P_to","Q_to","P_loss","Q_loss"].map(h=><th key={h} className="text-right px-1 py-0.5" style={{color:C.textDim}}>{h}</th>)}</tr>
+        </thead><tbody>{results.lines.map((l,i)=>(
+          <tr key={i} style={{ borderTop: `1px solid ${C.border}22` }}>
+            <td className="px-1 text-left" style={{color:C.textBright}}>{l.name}</td>
+            {[l.p_from,l.q_from,l.p_to,l.q_to,l.p_loss,l.q_loss].map((v,j)=>
+              <td key={j} className="px-1 text-right" style={{color: j>=4 ? C.yellow : C.text}}>{v.toFixed(5)}</td>
+            )}
+          </tr>
+        ))}</tbody></table>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SIMPOWER GUIDE
+// ═══════════════════════════════════════════════════════════════════════════
+const GUIDE_SECTIONS = [
+  { title: "Block Library Organisation", text: `Simscape Electrical organises blocks into sublibraries:\n\n• Electrical Sources — Three-Phase Source, Controlled Voltage/Current, PV Array, Wind Turbine\n• Elements — RLC loads/branches, PI section lines, transformers (2W, 3W), breakers, surge arresters\n• Machines — Synchronous Machine (round/salient pole), Asynchronous Machine (squirrel cage/wound rotor), PMSM\n• Power Electronics — Diode, Thyristor, IGBT, MOSFET, Universal Bridge\n• Measurements — V-I Measurement, Impedance Measurement, Sequence Analyzer, Fourier, RMS\n• Control — Powergui, Machine Measurement Demux, Multimeter\n\nEvery model MUST contain exactly one powergui block — it configures the solver engine.` },
+  { title: "powergui — The Simulation Engine", text: `Three simulation modes:\n\n1. Continuous — Uses Simulink ODE solvers (ode23tb for stiff power circuits). Variable-step. Most accurate.\n2. Discrete — Fixed time-step (e.g. Ts = 50 μs). Faster. Required for real-time/HIL.\n3. Phasor — Steady-state complex phasor at fundamental frequency. Algebraic, no transients. Equivalent to power flow.\n\nFor this course:\n• Experiments 1–6: Continuous with ode23tb\n• Experiment 10: Continuous, very small MaxStep\n• Phasor mode validates against pandapower results` },
+  { title: "Measurement & Data Extraction", text: `How to probe Simscape models:\n\n• Three-Phase V-I Measurement — Insert in series. Outputs Vabc and Iabc as Simulink signals.\n• RMS — Running RMS over one cycle. Converts instantaneous → steady-state magnitude.\n• Fourier — Extracts magnitude/phase of a specific harmonic. For THD analysis.\n• Sequence Analyzer — Decomposes into positive/negative/zero sequence. Essential for unbalanced faults.\n• To Workspace — Exports signals as timeseries for MATLAB post-processing. Always use 'Timeseries' format.\n• Machine Measurement Demux — Extracts ωr, δ, Te, Is, Vf from machine blocks.\n• Multimeter — Measures voltages/currents across any element without inserting a measurement block.` },
+  { title: "Programmatic Model Building", text: `All models in this course are scripted, not GUI-built:\n\nnew_system('mdl')          — Create blank model\nopen_system('mdl')         — Open in Simulink\nadd_block(lib, path, ...)  — Add a block with parameters\nset_param(path, ...)       — Modify parameters\nadd_line(mdl, src, dst)    — Connect ports\nsim('mdl')                 — Run simulation\n\nThis gives us:\n✓ Reproducibility (script = model)\n✓ Version control (git-friendly plain text)\n✓ Parameter sweeps (loop over designs)\n✓ No .mdl/.slx binary compatibility issues` },
+  { title: "Solver Selection", text: `Choosing the right solver:\n\node23tb — Default for power systems. Implicit trapezoidal. Good for stiff circuits (machines, trafos, lines).\node15s  — Multi-step, variable-order. Better for very stiff problems (power electronics switching). Slower per step.\node45   — Explicit Runge-Kutta. Only for non-stiff systems. DO NOT use with inductors + switches.\n\nMaxStep — Set ≤ 1/(20 × f_max):\n  • 50 Hz systems: MaxStep = 1e-4 (100 μs)\n  • Power electronics (kHz): MaxStep = 1e-6 (1 μs)\n  • Lightning impulse (MHz): MaxStep = 1e-8\n\nRelTol — Default 1e-3 is adequate. Use 1e-4 for precision.` },
+  { title: "Steady-State vs Transient Analysis", text: `The fundamental distinction:\n\nSteady-state (pandapower, MATPOWER, powergui Phasor):\n  • Solves algebraic equations: P = f(V, δ)\n  • Phasors at fundamental frequency — no time axis\n  • Cannot see inrush, switching transients, harmonics\n  • Use for: planning, dispatch, contingency analysis\n\nTransient / EMT (Simscape Continuous, scipy solve_ivp):\n  • Solves differential equations: L di/dt + Ri = v(t)\n  • Instantaneous waveforms — full time axis\n  • Sees everything: saturation, switching, arcing, travelling waves\n  • Use for: protection, insulation coordination, power quality\n\nExperiment 1 Case F demonstrates why steady-state misses capacitor switching overshoot.` },
+];
+
+function SimPowerGuide() {
+  const [open, setOpen] = useState(0);
+  return (
+    <div className="space-y-1.5">
+      <p className="text-xs mb-3" style={{ color: C.textMuted }}>
+        Each section covers a key concept you'll use throughout Experiments 2–10. The six case studies in the Python/MATLAB tabs exercise these skills.
+      </p>
+      {GUIDE_SECTIONS.map((s,i) => (
+        <div key={i} className="rounded-lg overflow-hidden" style={{ border: `1px solid ${C.border}` }}>
+          <button onClick={() => setOpen(open===i ? -1 : i)} className="w-full text-left px-4 py-2.5 flex justify-between items-center"
+            style={{ background: open===i ? C.card : "transparent", color: C.textBright }}>
+            <span className="text-sm font-bold">{s.title}</span>
+            <span className="text-xs" style={{ color: C.textDim }}>{open===i ? "▲" : "▼"}</span>
+          </button>
+          {open===i && <div className="px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap" style={{ background: C.bg, color: C.text, borderTop: `1px solid ${C.border}` }}>{s.text}</div>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CODE TABS
+// ═══════════════════════════════════════════════════════════════════════════
+const PY_CODE = `"""
+Experiment 1 — Survey of SimPowerSystems Models (Python Track)
+Six case studies, each matched 1:1 with the MATLAB track.
+pip install pandapower numpy scipy matplotlib
+"""
+import pandapower as pp
+import pandapower.networks as pn
+import pandapower.shortcircuit as sc
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+# ── Case A: SMIB (Skill: basic pandapower workflow) ─────────
+def case_a_smib():
+    """4-bus system: generator, transformer, line, infinite bus."""
+    net = pp.create_empty_network(sn_mva=100, f_hz=50)
+    b1 = pp.create_bus(net, 220, "HV Inf Bus")
+    b2 = pp.create_bus(net, 220, "Line End")
+    b3 = pp.create_bus(net, 22,  "Gen Terminal")
+
+    pp.create_ext_grid(net, b1, vm_pu=1.0)
+    pp.create_gen(net, b3, p_mw=100, vm_pu=1.05)
+    pp.create_line_from_parameters(net, b1, b2, length_km=100,
+        r_ohm_per_km=0.05, x_ohm_per_km=0.5,
+        c_nf_per_km=10, max_i_ka=1)
+    pp.create_transformer_from_parameters(net, b2, b3,
+        sn_mva=150, vn_hv_kv=220, vn_lv_kv=22,
+        vkr_percent=0.5, vk_percent=12,
+        pfe_kw=50, i0_percent=0.05, shift_degree=30)
+    pp.runpp(net, algorithm='nr')
+    print("=== Case A: SMIB ===")
+    print(net.res_bus[['vm_pu','va_degree','p_mw','q_mvar']])
+
+    # Swing equation demo: M d²δ/dt² = Pm - Pe_max sin(δ)
+    H, Pm, Pe_max = 5.0, 0.8, 2.0
+    ws = 2*np.pi*50
+    def swing(t, y):
+        return [y[1], (ws/(2*H))*(Pm - Pe_max*np.sin(y[0]))]
+    d0 = np.arcsin(Pm/Pe_max)
+    sol = solve_ivp(swing, [0, 2], [d0 + 0.1, 0], max_step=0.001)
+    fig, ax = plt.subplots(figsize=(8,4))
+    ax.plot(sol.t, np.degrees(sol.y[0]), 'b-', lw=1.5)
+    ax.set(xlabel='Time (s)', ylabel='δ (deg)',
+           title='Case A: Rotor Angle Oscillation')
+    ax.grid(True, alpha=0.3); plt.tight_layout()
+    plt.savefig('case_a_swing.png', dpi=150)
+    return net
+
+# ── Case B: Transformer OC/SC (Skill: parameter extraction) ──
+def case_b_transformer():
+    """Verify transformer equivalent circuit via simulation."""
+    net = pp.create_empty_network(sn_mva=100, f_hz=50)
+    b_hv = pp.create_bus(net, 110, "HV")
+    b_lv = pp.create_bus(net, 11, "LV")
+    pp.create_ext_grid(net, b_hv, vm_pu=1.0)
+    tid = pp.create_transformer_from_parameters(net, b_hv, b_lv,
+        sn_mva=50, vn_hv_kv=110, vn_lv_kv=11,
+        vkr_percent=1.0, vk_percent=10,
+        pfe_kw=30, i0_percent=0.1)
+    # OC test (no load)
+    pp.runpp(net)
+    print("\\n=== Case B: Transformer ===")
+    print(f"  No-load LV voltage: {net.res_bus.at[1,'vm_pu']:.4f} p.u.")
+    # Add rated load
+    pp.create_load(net, b_lv, p_mw=50, q_mvar=0)
+    pp.runpp(net)
+    print(f"  Full-load LV voltage: {net.res_bus.at[1,'vm_pu']:.4f} p.u.")
+    print(f"  Regulation = {(1-net.res_bus.at[1,'vm_pu'])*100:.2f}%")
+
+# ── Case C: Shunt Compensation (Skill: parametric sweep) ──────
+def case_c_compensation():
+    """Voltage vs reactive compensation at a loaded bus."""
+    q_range = np.arange(-30, 30, 2)
+    v_bus = []
+    for q_sh in q_range:
+        net = pp.create_empty_network(sn_mva=100, f_hz=50)
+        b1 = pp.create_bus(net, 110)
+        b2 = pp.create_bus(net, 110)
+        pp.create_ext_grid(net, b1, vm_pu=1.0)
+        pp.create_line_from_parameters(net, b1, b2, length_km=80,
+            r_ohm_per_km=0.1, x_ohm_per_km=0.4,
+            c_nf_per_km=10, max_i_ka=1)
+        pp.create_load(net, b2, p_mw=80, q_mvar=40)
+        if abs(q_sh) > 0.1:
+            pp.create_shunt(net, b2, q_mvar=q_sh)
+        pp.runpp(net)
+        v_bus.append(net.res_bus.at[1,'vm_pu'])
+    fig, ax = plt.subplots(figsize=(8,4))
+    ax.plot(q_range, v_bus, 'o-', color='#3b82f6', ms=3, lw=1.5)
+    ax.axhline(0.95, color='red', ls='--', lw=0.8)
+    ax.axhline(1.05, color='red', ls='--', lw=0.8)
+    ax.set(xlabel='Q_shunt (Mvar)', ylabel='V (p.u.)',
+           title='Case C: Voltage vs Shunt Compensation')
+    ax.grid(True, alpha=0.3); plt.tight_layout()
+    plt.savefig('case_c_comp.png', dpi=150)
+
+# ── Case D: Fault (Skill: short-circuit calculation) ──────────
+def case_d_fault():
+    """IEC 60909 fault analysis on IEEE 9-bus."""
+    net = pn.case9()
+    print("\\n=== Case D: Fault Analysis (IEEE 9-bus) ===")
+    sc.calc_sc(net, bus=4, fault='3ph')
+    print(f"  3ph fault at Bus 5:  Ik'' = {net.res_bus_sc.at[4,'ikss_ka']:.3f} kA")
+    sc.calc_sc(net, bus=4, fault='2ph')
+    print(f"  LL fault at Bus 5:   Ik'' = {net.res_bus_sc.at[4,'ikss_ka']:.3f} kA")
+    # Manual sequence network for SLG
+    # If = 3V / (Z1 + Z2 + Z0 + 3Zf)
+    Z1, Z2, Z0 = 0.05+0.25j, 0.05+0.25j, 0.1+0.4j
+    Vf = 1.0
+    If_slg = 3*Vf / (Z1 + Z2 + Z0)
+    print(f"  SLG fault (manual):  |If| = {abs(If_slg):.3f} p.u.")
+
+# ── Case E: Motor DOL Start (Skill: ODE modelling) ───────────
+def case_e_motor():
+    """d-q model of squirrel-cage IM, direct-on-line start."""
+    Rs, Rr, Xs, Xr, Xm = 0.01, 0.02, 0.1, 0.12, 3.0
+    H, TL, Vs = 0.5, 0.5, 1.0
+    ws = 2*np.pi*50
+    def motor(t, y):
+        pds, pqs, pdr, pqr, wr = y
+        s = 1 - wr
+        D = Xs*Xr - Xm**2
+        ids = (Xr*pds - Xm*pdr)/D
+        iqs = (Xr*pqs - Xm*pqr)/D
+        idr = (-Xm*pds + Xs*pdr)/D
+        iqr = (-Xm*pqs + Xs*pqr)/D
+        dpds = ws*(0    - Rs*ids + pqs)
+        dpqs = ws*(Vs   - Rs*iqs - pds)
+        dpdr = ws*(0    - Rr*idr + s*pqr)
+        dpqr = ws*(0    - Rr*iqr - s*pdr)
+        Te = pds*iqs - pqs*ids
+        dwr = (Te - TL)/(2*H)
+        return [dpds, dpqs, dpdr, dpqr, dwr]
+    sol = solve_ivp(motor, [0,3], [0,0,0,0,0], method='BDF', max_step=5e-4)
+    D = Xs*Xr - Xm**2
+    Is = np.sqrt(((Xr*sol.y[0]-Xm*sol.y[2])/D)**2 +
+                 ((Xr*sol.y[1]-Xm*sol.y[3])/D)**2)
+    Te = sol.y[0]*((Xr*sol.y[1]-Xm*sol.y[3])/D) - \\
+         sol.y[1]*((Xr*sol.y[0]-Xm*sol.y[2])/D)
+    fig, axes = plt.subplots(3,1, figsize=(9,7), sharex=True)
+    axes[0].plot(sol.t, sol.y[4], 'b-', lw=1)
+    axes[0].set_ylabel('ωr (p.u.)'); axes[0].set_title('Case E: DOL Motor Start')
+    axes[1].plot(sol.t, Is, 'r-', lw=0.7); axes[1].set_ylabel('|Is| (p.u.)')
+    axes[2].plot(sol.t, Te, 'g-', lw=0.7); axes[2].set_ylabel('Te (p.u.)')
+    axes[2].set_xlabel('Time (s)')
+    for ax in axes: ax.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig('case_e_motor.png', dpi=150)
+
+# ── Case F: Cap Switching Transient (Skill: why EMT matters) ──
+def case_f_transient():
+    """Capacitor energisation — shows what power flow CANNOT see."""
+    R, L, Cap = 0.5, 0.01, 100e-6
+    Vm = 11e3*np.sqrt(2/3)
+    w, f0 = 2*np.pi*50, 1/(2*np.pi*np.sqrt(0.01*100e-6))
+    print(f"\\n=== Case F: Cap Switching ===")
+    print(f"  Natural freq f0 = {f0:.0f} Hz")
+    fig, axes = plt.subplots(1, 2, figsize=(12,4))
+    for idx, phi_deg in enumerate([0, 90]):
+        phi = np.radians(phi_deg)
+        def ode(t, y):
+            return [( Vm*np.sin(w*t+phi) - R*y[0] - y[1] ) / L, y[0]/Cap]
+        sol = solve_ivp(ode, [0, 0.06], [0, 0], max_step=1e-5)
+        axes[idx].plot(sol.t*1e3, sol.y[1]/1e3, lw=1.2)
+        axes[idx].axhline(Vm/1e3, color='gray', ls=':', lw=0.8)
+        axes[idx].set(xlabel='ms', ylabel='Vcap (kV)',
+                      title=f'Switch at φ₀={phi_deg}°')
+        axes[idx].grid(True, alpha=0.3)
+    plt.suptitle('Case F: Cap Switching — Steady-State Misses This')
+    plt.tight_layout(); plt.savefig('case_f_transient.png', dpi=150)
+
+if __name__ == "__main__":
+    case_a_smib(); case_b_transformer(); case_c_compensation()
+    case_d_fault(); case_e_motor(); case_f_transient()
+    plt.show()
+    print("\\nExperiment 1 complete. Plots saved.")`;
+
+const ML_CODE = `%% Experiment 1 — Survey of SimPowerSystems Models (MATLAB Track)
+%  Six case studies. Each introduces a new Simscape Electrical skill.
+%  Requires: MATLAB R2020b+, Simscape Electrical
+clear; clc; close all;
+
+%% Case A: SMIB — Skills: powergui, add_block, set_param, add_line, sim
+mdl = 'case_a_smib';
+if bdIsLoaded(mdl), close_system(mdl,0); end
+new_system(mdl); open_system(mdl);
+
+add_block('powerlib/powergui', [mdl '/powergui'], ...
+    'SimulationMode','Continuous','Position',[50 30 150 70]);
+add_block('powerlib/Electrical Sources/Three-Phase Source', ...
+    [mdl '/InfBus'], 'Voltage','sqrt(2/3)*220e3', ...
+    'Frequency','50','Position',[100 150 160 210]);
+add_block('powerlib/Elements/Three-Phase PI Section Line', ...
+    [mdl '/Line'],'Frequency','50','Resistance','0.05', ...
+    'Inductance','1.59e-3','Capacitance','10e-9', ...
+    'Length','100','Position',[280 150 380 210]);
+add_block('powerlib/Elements/Three-Phase Transformer (Two Windings)',...
+    [mdl '/Trafo'],'NominalPower','150e6', ...
+    'Winding1','[220e3 0.005 0.12]', ...
+    'Winding2','[22e3 0.005 0.12]','Position',[480 150 560 210]);
+% Scope for voltage
+add_block('powerlib/Measurements/Three-Phase V-I Measurement',...
+    [mdl '/VI'],'VoltageMeasurement','phase-to-ground');
+add_block('simulink/Sinks/Scope',[mdl '/Vscope']);
+add_line(mdl,'InfBus/1','Line/1','autoroute','on');
+add_line(mdl,'Line/2','VI/1','autoroute','on');
+add_line(mdl,'VI/1','Trafo/1','autoroute','on');
+add_line(mdl,'VI/3','Vscope/1','autoroute','on');
+set_param(mdl,'StopTime','0.2','Solver','ode23tb','MaxStep','1e-4');
+fprintf('Case A: SMIB built. sim(''%s'') to run.\\n',mdl);
+
+%% Case B: Transformer — Skills: Measurement blocks, To Workspace
+mdl_b = 'case_b_trafo';
+if bdIsLoaded(mdl_b), close_system(mdl_b,0); end
+new_system(mdl_b); open_system(mdl_b);
+add_block('powerlib/powergui',[mdl_b '/powergui'],'SimulationMode','Continuous');
+add_block('powerlib/Electrical Sources/Three-Phase Source',[mdl_b '/Src'],...
+    'Voltage','sqrt(2/3)*110e3','Frequency','50');
+add_block('powerlib/Measurements/Three-Phase V-I Measurement',...
+    [mdl_b '/VI_HV'],'VoltageMeasurement','phase-to-ground','CurrentMeasurement','yes');
+add_block('powerlib/Elements/Three-Phase Transformer (Two Windings)',...
+    [mdl_b '/Trafo'],'NominalPower','50e6',...
+    'Winding1','[110e3 0.01 0.1]','Winding2','[11e3 0.01 0.1]');
+add_block('powerlib/Measurements/Three-Phase V-I Measurement',...
+    [mdl_b '/VI_LV'],'VoltageMeasurement','phase-to-ground');
+add_block('simulink/Sinks/To Workspace',[mdl_b '/V_HV_ws'],...
+    'VariableName','V_HV','SaveFormat','Timeseries');
+add_block('simulink/Sinks/To Workspace',[mdl_b '/V_LV_ws'],...
+    'VariableName','V_LV','SaveFormat','Timeseries');
+add_line(mdl_b,'Src/1','VI_HV/1','autoroute','on');
+add_line(mdl_b,'VI_HV/1','Trafo/1','autoroute','on');
+add_line(mdl_b,'Trafo/2','VI_LV/1','autoroute','on');
+add_line(mdl_b,'VI_HV/3','V_HV_ws/1','autoroute','on');
+add_line(mdl_b,'VI_LV/3','V_LV_ws/1','autoroute','on');
+set_param(mdl_b,'StopTime','0.1','Solver','ode23tb','MaxStep','1e-4');
+fprintf('Case B: Transformer built (V-I Measurement + To Workspace).\\n');
+
+%% Case C: Compensation — Skills: Breaker, timed switching
+mdl_c = 'case_c_comp';
+if bdIsLoaded(mdl_c), close_system(mdl_c,0); end
+new_system(mdl_c); open_system(mdl_c);
+add_block('powerlib/powergui',[mdl_c '/powergui'],'SimulationMode','Continuous');
+add_block('powerlib/Electrical Sources/Three-Phase Source',[mdl_c '/Src'],...
+    'Voltage','sqrt(2/3)*110e3','Frequency','50');
+add_block('powerlib/Elements/Three-Phase PI Section Line',[mdl_c '/Line'],...
+    'Frequency','50','Resistance','0.1','Inductance','1.27e-3',...
+    'Capacitance','10e-9','Length','80');
+add_block('powerlib/Elements/Three-Phase Series RLC Load',[mdl_c '/Load'],...
+    'NominalVoltage','110e3','ActivePower','80e6','InductivePower','40e6');
+add_block('powerlib/Elements/Three-Phase Breaker',[mdl_c '/BRK'],...
+    'SwitchingTimes','[0.05 0.05 0.05]');
+add_block('powerlib/Elements/Three-Phase Series RLC Load',[mdl_c '/Cap'],...
+    'NominalVoltage','110e3','CapacitivePower','20e6','ActivePower','0');
+add_block('powerlib/Measurements/Three-Phase V-I Measurement',...
+    [mdl_c '/VI'],'VoltageMeasurement','phase-to-ground');
+add_block('simulink/Sinks/To Workspace',[mdl_c '/Vws'],...
+    'VariableName','V_comp','SaveFormat','Timeseries');
+add_line(mdl_c,'Src/1','Line/1','autoroute','on');
+add_line(mdl_c,'Line/2','VI/1','autoroute','on');
+add_line(mdl_c,'VI/1','Load/1','autoroute','on');
+add_line(mdl_c,'VI/1','BRK/1','autoroute','on');
+add_line(mdl_c,'BRK/2','Cap/1','autoroute','on');
+add_line(mdl_c,'VI/3','Vws/1','autoroute','on');
+set_param(mdl_c,'StopTime','0.2','Solver','ode23tb','MaxStep','5e-5');
+fprintf('Case C: Shunt compensation built (Breaker + timed switch).\\n');
+
+%% Case D: Fault — Skills: Fault block, Sequence Analyzer
+mdl_d = 'case_d_fault';
+if bdIsLoaded(mdl_d), close_system(mdl_d,0); end
+new_system(mdl_d); open_system(mdl_d);
+add_block('powerlib/powergui',[mdl_d '/powergui'],'SimulationMode','Continuous');
+add_block('powerlib/Electrical Sources/Three-Phase Source',[mdl_d '/Src'],...
+    'Voltage','sqrt(2/3)*110e3','Frequency','50');
+add_block('powerlib/Elements/Three-Phase PI Section Line',[mdl_d '/Line'],...
+    'Frequency','50','Resistance','0.05','Inductance','1.59e-3',...
+    'Capacitance','10e-9','Length','50');
+add_block('powerlib/Elements/Three-Phase Fault',[mdl_d '/Fault'],...
+    'FaultA','on','FaultB','on','FaultC','on','GroundFault','on',...
+    'SwitchTimes','[0.1 0.2]');
+add_block('powerlib/Measurements/Three-Phase V-I Measurement',...
+    [mdl_d '/VI'],'CurrentMeasurement','yes');
+add_block('simulink/Sinks/To Workspace',[mdl_d '/Iws'],...
+    'VariableName','I_fault','SaveFormat','Timeseries');
+add_line(mdl_d,'Src/1','VI/1','autoroute','on');
+add_line(mdl_d,'VI/1','Line/1','autoroute','on');
+add_line(mdl_d,'Line/2','Fault/1','autoroute','on');
+add_line(mdl_d,'VI/4','Iws/1','autoroute','on');
+set_param(mdl_d,'StopTime','0.3','Solver','ode23tb','MaxStep','5e-5');
+fprintf('Case D: Fault analysis built (3ph fault, 100-200ms).\\n');
+
+%% Case E: Motor Start — Skills: Machines lib, Mech coupling, Demux
+mdl_e = 'case_e_motor';
+if bdIsLoaded(mdl_e), close_system(mdl_e,0); end
+new_system(mdl_e); open_system(mdl_e);
+add_block('powerlib/powergui',[mdl_e '/powergui'],'SimulationMode','Continuous');
+add_block('powerlib/Electrical Sources/Three-Phase Source',[mdl_e '/Src'],...
+    'Voltage','sqrt(2/3)*400','Frequency','50');
+add_block('powerlib/Machines/Asynchronous Machine SI Units',...
+    [mdl_e '/IM'],'NominalPower','[37.3e3 400 50]','RotorType','Squirrel-cage');
+add_block('simulink/Sources/Constant',[mdl_e '/Tm'],'Value','0');
+add_block('powerlib/Machines/Machine Measurement Demux',[mdl_e '/Demux']);
+add_block('simulink/Sinks/To Workspace',[mdl_e '/wm_ws'],...
+    'VariableName','motor_data','SaveFormat','Timeseries');
+add_line(mdl_e,'Src/1','IM/1','autoroute','on');
+add_line(mdl_e,'Tm/1','IM/2','autoroute','on');
+add_line(mdl_e,'IM/2','Demux/1','autoroute','on');
+set_param(mdl_e,'StopTime','3','Solver','ode23tb','MaxStep','1e-4');
+fprintf('Case E: DOL motor start built (Machine Demux for wr, Te, Is).\\n');
+
+%% Case F: Cap Transient — Skills: Solver config, MaxStep tuning
+mdl_f = 'case_f_cap';
+if bdIsLoaded(mdl_f), close_system(mdl_f,0); end
+new_system(mdl_f); open_system(mdl_f);
+add_block('powerlib/powergui',[mdl_f '/powergui'],'SimulationMode','Continuous');
+add_block('powerlib/Electrical Sources/AC Voltage Source',[mdl_f '/Vsrc'],...
+    'Amplitude','sqrt(2)*11e3/sqrt(3)','Frequency','50');
+add_block('powerlib/Elements/Series RLC Branch',[mdl_f '/RL'],...
+    'Resistance','0.5','Inductance','0.01');
+add_block('powerlib/Elements/Series RLC Branch',[mdl_f '/Cap'],...
+    'Resistance','0','Capacitance','100e-6');
+add_block('powerlib/Elements/Breaker',[mdl_f '/BRK'],'SwitchingTimes','0.01');
+add_block('powerlib/Measurements/Voltage Measurement',[mdl_f '/Vmeas']);
+add_block('simulink/Sinks/To Workspace',[mdl_f '/Vcap_ws'],...
+    'VariableName','V_cap','SaveFormat','Timeseries');
+add_line(mdl_f,'Vsrc/+','BRK/1','autoroute','on');
+add_line(mdl_f,'BRK/2','RL/1','autoroute','on');
+add_line(mdl_f,'RL/2','Cap/1','autoroute','on');
+add_line(mdl_f,'Cap/2','Vsrc/-','autoroute','on');
+add_line(mdl_f,'Vmeas/+','RL/2','autoroute','on');
+add_line(mdl_f,'Vmeas/-','Cap/2','autoroute','on');
+add_line(mdl_f,'Vmeas/1','Vcap_ws/1','autoroute','on');
+set_param(mdl_f,'StopTime','0.06','Solver','ode23tb','MaxStep','1e-5');
+fprintf('Case F: Cap switching built (fine MaxStep for transient).\\n');
+
+fprintf('\\n=== All 6 models built. Run sim(model_name) for each. ===\\n');`;
+
+function CodeBlock({ code, lang }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="rounded-lg overflow-hidden" style={{ border: `1px solid ${C.border}` }}>
+      <div className="flex items-center justify-between px-4 py-2" style={{ background: C.card, borderBottom: `1px solid ${C.border}` }}>
+        <span className="text-xs font-mono" style={{ color: C.textDim }}>{lang}</span>
+        <button onClick={() => { navigator.clipboard.writeText(code); setCopied(true); setTimeout(()=>setCopied(false),2000); }}
+          className="text-xs px-3 py-1 rounded" style={{ background: copied ? "#065f46" : C.border, color: copied ? "#6ee7b7" : C.text }}>
+          {copied ? "✓ Copied" : "Copy All"}
+        </button>
+      </div>
+      <pre className="p-4 overflow-x-auto text-xs leading-relaxed" style={{ background: "#0d1117", color: "#c9d1d9", maxHeight: "70vh" }}><code>{code}</code></pre>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPERIMENTS
+// ═══════════════════════════════════════════════════════════════════════════
+const EXPERIMENTS = [
+  { id:1, short:"SimPower Survey", title:"Power Simulation and Scripting; SimPowerSystems™ Models", ready:true },
+  { id:2, short:"Circuit Devices", title:"Models of Power Circuit Devices; Measuring and Control Blocks", ready:false },
+  { id:3, short:"Power Electronics", title:"Power Electronics Devices Simulation", ready:false },
+  { id:4, short:"Machines & Drives", title:"Electric Machine and Electric Drive Simulation", ready:false },
+  { id:5, short:"Production & Tx", title:"Electric Power Production and Transmission", ready:false },
+  { id:6, short:"Renewables & Wind", title:"Renewable Sources and Wind Generators", ready:false },
+  { id:7, short:"Scripting", title:"Power System Scripting in Python/MATLAB", ready:false },
+  { id:8, short:"Power Flow", title:"Power Flow Analysis (Newton-Raphson from scratch)", ready:false },
+  { id:9, short:"Optimal PF", title:"Optimal Power Flow Analysis", ready:false },
+  { id:10, short:"Time Domain", title:"Time Domain Analysis: Numerical Integration and Transients", ready:false },
+  { id:11, short:"Challenges", title:"Challenges of Scripting for Power System Education", ready:false },
+];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════════════
+function PowerSystemLab() {
+  const [activeExp, setActiveExp] = useState(1);
+  const [activeTab, setActiveTab] = useState("interactive");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const exp = EXPERIMENTS.find(e => e.id === activeExp);
+  const tabs = [
+    { id: "interactive", label: "⚡ Power Flow" },
+    { id: "guide", label: "📘 SimPower Guide" },
+    { id: "python", label: "🐍 Python" },
+    { id: "matlab", label: "📊 MATLAB" },
+  ];
+
+  return (
+    <div className="min-h-screen flex" style={{ background: C.bg, fontFamily: "'Segoe UI', system-ui, sans-serif" }}>
+      <button onClick={() => setSidebarOpen(!sidebarOpen)}
+        className="fixed top-3 left-3 z-50 p-2 rounded-lg lg:hidden"
+        style={{ background: C.card, color: C.textBright, border: `1px solid ${C.border}` }}>
+        {sidebarOpen ? "✕" : "☰"}
+      </button>
+      <aside className={`fixed lg:static inset-y-0 left-0 z-40 w-64 transform transition-transform duration-200
+        ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0`}
+        style={{ background: "#0a0f1a", borderRight: `1px solid ${C.border}` }}>
+        <div className="p-4">
+          <div className="text-xs font-bold tracking-widest" style={{ color: C.textDim }}>PCC-EE804L</div>
+          <h1 className="text-sm font-bold mt-1" style={{ color: C.textBright }}>Power System Simulation<br/>& Scripting Lab</h1>
+          <div className="text-xs mt-0.5" style={{ color: C.textDim }}>University of Kashmir · 8th Sem</div>
+        </div>
+        <nav className="px-2 pb-4 overflow-y-auto" style={{ maxHeight: "calc(100vh - 130px)" }}>
+          {EXPERIMENTS.map(e => (
+            <button key={e.id} onClick={() => { if(e.ready){setActiveExp(e.id);setSidebarOpen(false);} }}
+              className={`w-full text-left px-2.5 py-1.5 rounded-lg mb-0.5 text-xs flex items-center gap-1.5 ${!e.ready?'opacity-30 cursor-not-allowed':'cursor-pointer'}`}
+              style={{ background: activeExp===e.id?C.card:"transparent", color: activeExp===e.id?C.textBright:C.textMuted,
+                borderLeft: activeExp===e.id?`3px solid ${C.blue}`:"3px solid transparent" }} disabled={!e.ready}>
+              <span className="font-mono w-4" style={{color:C.textDim}}>{e.id}</span>
+              <span className="truncate">{e.short}</span>
+              {!e.ready && <span className="ml-auto px-1 rounded" style={{background:C.card,color:C.textDim,fontSize:8}}>Soon</span>}
+            </button>
+          ))}
+        </nav>
+        <div className="px-4 py-2 text-xs" style={{ color: C.border, borderTop: `1px solid ${C.border}` }}>
+          Prof. Mohd Aarish Shaheen<br/>Dept. of Electrical Engineering
+        </div>
+      </aside>
+      {sidebarOpen && <div className="fixed inset-0 z-30 bg-black/50 lg:hidden" onClick={()=>setSidebarOpen(false)}/>}
+      <main className="flex-1 min-w-0 p-3 lg:p-6">
+        <div className="max-w-5xl mx-auto">
+          <div className="mb-4 pl-10 lg:pl-0">
+            <div className="text-xs font-bold tracking-wider mb-0.5" style={{color:C.blue}}>EXPERIMENT {exp.id}</div>
+            <h2 className="text-lg font-bold" style={{color:C.textBright}}>{exp.title}</h2>
+            <p className="text-xs mt-0.5" style={{color:C.textDim}}>6 case studies · MATLAB ↔ Python 1:1 · All values in per-unit</p>
+          </div>
+          {exp.ready ? (<>
+            <div className="flex gap-0.5 mb-4 overflow-x-auto" style={{borderBottom:`1px solid ${C.border}`}}>
+              {tabs.map(t => (
+                <button key={t.id} onClick={()=>setActiveTab(t.id)}
+                  className="px-3 py-2 text-xs font-medium whitespace-nowrap rounded-t-lg"
+                  style={{ background: activeTab===t.id?C.card:"transparent", color: activeTab===t.id?C.textBright:C.textDim,
+                    borderBottom: activeTab===t.id?`2px solid ${C.blue}`:"2px solid transparent" }}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+            {activeTab==="interactive" && <InteractivePF/>}
+            {activeTab==="guide" && <SimPowerGuide/>}
+            {activeTab==="python" && <div className="space-y-3">
+              <p className="text-xs" style={{color:C.textMuted}}>Install: <code className="px-1.5 py-0.5 rounded" style={{background:C.card,color:C.cyan,fontSize:10}}>pip install pandapower numpy scipy matplotlib</code></p>
+              <CodeBlock code={PY_CODE} lang="Python — exp01_simulation_models.py"/>
+            </div>}
+            {activeTab==="matlab" && <div className="space-y-3">
+              <p className="text-xs" style={{color:C.textMuted}}>Requires MATLAB R2020b+ with Simscape Electrical</p>
+              <CodeBlock code={ML_CODE} lang="MATLAB — exp01_simulation_models.m"/>
+            </div>}
+          </>) : (
+            <div className="flex flex-col items-center justify-center py-20 rounded-xl" style={{background:`${C.card}33`,border:`1px dashed ${C.border}`}}>
+              <div className="text-4xl mb-4">🔧</div>
+              <div className="text-base font-bold" style={{color:C.textMuted}}>Coming Soon</div>
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(PowerSystemLab));
+  </script>
+</body>
+</html>

@@ -15,7 +15,7 @@ This repository contains complete, runnable code for all 11 experiments in the *
 | **MATLAB** | Simscape Electrical, MATPOWER | Academic License | `matlab/` |
 
 > **Interactive Lab Manual**: An interactive web-based lab manual with live simulations is available at:  
-> 🔗 *https://claude.ai/public/artifacts/9911515a-09a8-48a0-bdb9-995971b65b25*
+> 🔗 *[Published artifact URL will go here]*
 
 ---
 
@@ -145,7 +145,7 @@ The web-based interactive lab manual includes:
 - **Code tabs** — copy Python or MATLAB code directly from the browser
 - **Theory sections** — key equations and procedural steps for each experiment
 
-Access it at: 🔗 *https://claude.ai/public/artifacts/9911515a-09a8-48a0-bdb9-995971b65b25*  
+Access it at: 🔗 *[Published artifact URL]*  
 No installation, no login, no account needed — just a web browser.
 
 ---
@@ -164,13 +164,12 @@ This is a teaching repository. If you find bugs or want to suggest improvements:
 
 MIT License — see [LICENSE](LICENSE).
 
-Course material © 2026 Mohd Aarish Shaheen, Department of Electrical Engineering, University of Kashmir.
+Course material © 2026 Prof. Mohd Aarish Shaheen, Department of Electrical Engineering, University of Kashmir.
 
 ---
 
 ## Acknowledgements
 
-- [MATLAB](https://www.mathworks.com/) — MathWorks is the leading developer of mathematical computing software for engineers and scientists.
 - [pandapower](https://www.pandapower.org/) — Fraunhofer IEE & University of Kassel
 - [MATPOWER](https://matpower.org/) — Cornell University
 - [PyPSA](https://pypsa.org/) — Karlsruhe Institute of Technology & TU Berlin
