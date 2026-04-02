@@ -164,7 +164,7 @@ This is a teaching repository. If you find bugs or want to suggest improvements:
 
 MIT License — see [LICENSE](LICENSE).
 
-Course material © 2026 Prof. Mohd Aarish Shaheen, Department of Electrical Engineering, University of Kashmir.
+Course material © 2026 Mohd Aarish Shaheen, Department of Electrical Engineering, University of Kashmir.
 
 ---
 
