@@ -170,6 +170,7 @@ Course material © 2026 Mohd Aarish Shaheen, Department of Electrical Engineerin
 
 ## Acknowledgements
 
+- [MATLAB](https://www.mathworks.com/) — MathWorks is the leading developer of mathematical computing software for engineers and scientists.
 - [pandapower](https://www.pandapower.org/) — Fraunhofer IEE & University of Kassel
 - [MATPOWER](https://matpower.org/) — Cornell University
 - [PyPSA](https://pypsa.org/) — Karlsruhe Institute of Technology & TU Berlin
