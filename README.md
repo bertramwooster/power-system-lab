@@ -14,8 +14,7 @@ This repository contains complete, runnable code for all 11 experiments in the *
 | **Python** | pandapower, NumPy, SciPy, Matplotlib | Free / Open Source | `python/` |
 | **MATLAB** | Simscape Electrical, MATPOWER | Academic License | `matlab/` |
 
-> **Interactive Lab Manual**: An interactive web-based lab manual with live simulations is available at:  
-> 🔗 *[Published artifact URL will go here]*
+> **Interactive Lab Manual**: An interactive web-based lab manual with live simulations is available at this repo's Github webpage
 
 ---
 
