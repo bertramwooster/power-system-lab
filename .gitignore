@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MATLAB
+*.slx
+*.slxc
+*.mdl
+slprj/
+*.autosave
+*.asv
+*.mexa64
+*.mexmaci64
+*.mexw64
+codegen/
+
+# Generated outputs (students regenerate these)
+*.png
+*.pdf
+*.csv
+*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
